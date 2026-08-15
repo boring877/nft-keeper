@@ -1,0 +1,103 @@
+// GachaWiki OGs keeper — one tick, run by GitHub Actions every 15 min.
+//   1. Prices: pin ETH + $GW mint prices to the same USD target (operator key).
+//   2. Buyback: withdraw accumulated ETH mint revenue, swap it for $GW on the
+//      GW/WETH Uniswap V3 pool, and burn every $GW bought (owner key).
+// Runs from GitHub runner IPs (the Robinhood RPC throttles Cloudflare Worker
+// egress). All keys come from GitHub Secrets; nothing sensitive lives here.
+const { ethers } = require('ethers');
+
+const RPC = process.env.RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
+const NFT = process.env.NFT_CONTRACT || '0x9C0f41ce4F8e72F866CC79Acd80386472c53B40B';
+const GW_TOKEN = '0x50bE7832849EFEdB15611799074FcC409522f27A';
+const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+const ROUTER = '0xcaf681a66d020601342297493863e78c959e5cb2';
+const QUOTER = '0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7';
+const DEAD = '0x000000000000000000000000000000000000dEaD';
+const POOL_FEE = 10000;
+const TARGET_USD = 2;
+const DRIFT_PCT = 2n;
+const FLOOR_ETH_WEI = 400000000000000n; // mirrors the contract's price floors
+const FLOOR_GW_UNITS = 100000n * 10n ** 18n;
+const BUYBACK_MIN_WEI = 1000000000000000n; // act once ≥0.001 ETH accumulates
+
+const NFT_ABI = [
+  'function mintPrice() view returns (uint256)',
+  'function gwMintPrice() view returns (uint256)',
+  'function updatePrices(uint256 ethPrice, uint256 gwPrice) external',
+  'function withdraw(address to) external',
+];
+const ERC20_ABI = ['function balanceOf(address) view returns (uint256)', 'function transfer(address,uint256) returns (bool)'];
+const QUOTER_ABI = ['function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160,uint32,uint256)'];
+const ROUTER_ABI = ['function multicall(bytes[] data) payable returns (bytes[] results)', 'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256)'];
+
+const report = { prices: null, buyback: null };
+
+async function keepPrices(provider) {
+  const ethUsd = parseFloat((await (await fetch('https://api.coinbase.com/v2/prices/ETH-USD/spot')).json()).data.amount);
+  const pairs = (await (await fetch('https://api.dexscreener.com/latest/dex/tokens/' + GW_TOKEN)).json()).pairs;
+  const pair = (pairs || []).find((x) => x.liquidity && x.liquidity.usd > 100);
+  if (!pair) throw new Error('no liquid GW pair');
+  const gwUsd = parseFloat(pair.priceUsd);
+
+  let ethWei = BigInt(Math.ceil((TARGET_USD / ethUsd) * 1e6)) * 10n ** 12n;
+  let gwUnits = BigInt(Math.ceil((TARGET_USD / gwUsd) / 1000) * 1000) * 10n ** 18n;
+  if (ethWei < FLOOR_ETH_WEI) ethWei = FLOOR_ETH_WEI;
+  if (gwUnits < FLOOR_GW_UNITS) gwUnits = FLOOR_GW_UNITS;
+
+  const nft = new ethers.Contract(NFT, NFT_ABI, provider);
+  const [curEth, curGw] = await Promise.all([nft.mintPrice(), nft.gwMintPrice()]);
+  const drifted = (cur, tgt) => cur === 0n || ((cur > tgt ? cur - tgt : tgt - cur) * 100n > cur * DRIFT_PCT);
+
+  const out = { market: { ethUsd, gwUsd }, target: { eth: Number(ethWei) / 1e18, gw: Number(gwUnits) / 1e18 }, onChain: { eth: Number(curEth) / 1e18, gw: Number(curGw) / 1e18 }, updated: false };
+  if (drifted(curEth, ethWei) || drifted(curGw, gwUnits)) {
+    const wallet = new ethers.Wallet(process.env.OPERATOR_PRIVATE_KEY, provider);
+    const tx = await (await nft.connect(wallet)).updatePrices(ethWei, gwUnits, { gasLimit: 150000 });
+    await tx.wait();
+    out.updated = true;
+    out.tx = tx.hash;
+  }
+  return out;
+}
+
+async function buybackBurn(provider) {
+  const revenue = await provider.getBalance(NFT);
+  const out = { revenueEth: ethers.formatEther(revenue) };
+  if (revenue < BUYBACK_MIN_WEI) { out.skipped = 'below 0.001 ETH threshold'; return out; }
+
+  const owner = new ethers.Wallet(process.env.OWNER_PRIVATE_KEY, provider);
+  const nft = new ethers.Contract(NFT, NFT_ABI, owner);
+  const gw = new ethers.Contract(GW_TOKEN, ERC20_ABI, owner);
+  const quoter = new ethers.Contract(QUOTER, QUOTER_ABI, provider);
+  const router = new ethers.Contract(ROUTER, ROUTER_ABI, owner);
+
+  const q = await quoter.quoteExactInputSingle.staticCall({ tokenIn: WETH, tokenOut: GW_TOKEN, amountIn: revenue, fee: POOL_FEE, sqrtPriceLimitX96: 0 });
+  const minOut = (q[0] * 97n) / 100n;
+  out.minGwOut = ethers.formatEther(minOut);
+
+  const gwBefore = await gw.balanceOf(owner.address);
+  const t1 = await nft.withdraw(owner.address, { gasLimit: 100000 });
+  await t1.wait();
+  const t2 = await router.multicall([
+    (await router.exactInputSingle.populateTransaction({
+      tokenIn: WETH, tokenOut: GW_TOKEN, fee: POOL_FEE, recipient: owner.address,
+      amountIn: revenue, amountOutMinimum: minOut, sqrtPriceLimitX96: 0,
+    })).data,
+  ], { value: revenue, gasLimit: 400000 });
+  await t2.wait();
+  const bought = (await gw.balanceOf(owner.address)) - gwBefore;
+  const t3 = await gw.transfer(DEAD, bought, { gasLimit: 100000 });
+  await t3.wait();
+
+  out.done = true;
+  out.gwBoughtAndBurned = ethers.formatEther(bought);
+  out.txs = [t1.hash, t2.hash, t3.hash];
+  return out;
+}
+
+(async () => {
+  const provider = new ethers.JsonRpcProvider(RPC);
+  report.prices = await keepPrices(provider).catch((e) => ({ error: String(e.message || e).slice(0, 300) }));
+  report.buyback = await buybackBurn(provider).catch((e) => ({ error: String(e.message || e).slice(0, 300) }));
+  console.log(JSON.stringify(report, null, 1));
+  if (report.prices.error || report.buyback.error) process.exit(1);
+})();

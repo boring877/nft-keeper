@@ -1,0 +1,21 @@
+name: keeper
+on:
+  schedule:
+    - cron: "*/15 * * * *" # every 15 min (GitHub may add a few minutes of jitter)
+  workflow_dispatch: {} # manual trigger from the Actions tab / gh CLI
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install ethers@6
+      - run: node keeper.js
+        env:
+          RPC_URL: https://rpc.mainnet.chain.robinhood.com
+          NFT_CONTRACT: ${{ vars.NFT_CONTRACT }}
+          OPERATOR_PRIVATE_KEY: ${{ secrets.OPERATOR_PRIVATE_KEY }}
+          OWNER_PRIVATE_KEY: ${{ secrets.OWNER_PRIVATE_KEY }}
