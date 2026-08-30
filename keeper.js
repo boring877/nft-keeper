@@ -32,12 +32,44 @@ const ROUTER_ABI = ['function multicall(bytes[] data) payable returns (bytes[] r
 
 const report = { prices: null, buyback: null };
 
+// GitHub runners share egress IPs, so Coinbase/Dexscreener intermittently 429
+// or return error bodies; retry before giving up on a source.
+async function fetchJson(url, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((r) => setTimeout(r, 3000 * i));
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return await res.json();
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
 async function keepPrices(provider) {
-  const ethUsd = parseFloat((await (await fetch('https://api.coinbase.com/v2/prices/ETH-USD/spot')).json()).data.amount);
-  const pairs = (await (await fetch('https://api.dexscreener.com/latest/dex/tokens/' + GW_TOKEN)).json()).pairs;
-  const pair = (pairs || []).find((x) => x.liquidity && x.liquidity.usd > 100);
-  if (!pair) throw new Error('no liquid GW pair');
-  const gwUsd = parseFloat(pair.priceUsd);
+  const ethUsd = parseFloat((await fetchJson('https://api.coinbase.com/v2/prices/ETH-USD/spot')).data.amount);
+  if (!(ethUsd > 0)) throw new Error('bad ethUsd ' + ethUsd);
+
+  let gwUsd, gwSrc;
+  try {
+    const pairs = (await fetchJson('https://api.dexscreener.com/latest/dex/tokens/' + GW_TOKEN)).pairs;
+    const pair = (pairs || []).find((x) => x.liquidity && x.liquidity.usd > 100);
+    if (!pair) throw new Error('no liquid GW pair');
+    gwUsd = parseFloat(pair.priceUsd);
+    gwSrc = 'dexscreener';
+  } catch (e) {
+    // Dexscreener unavailable — take the marginal price straight from the same
+    // GW/WETH pool the buyback swaps through; pool price × ETH/USD is exactly
+    // what Dexscreener reports for this pair anyway.
+    const quoter = new ethers.Contract(QUOTER, QUOTER_ABI, provider);
+    const q = await quoter.quoteExactInputSingle.staticCall({ tokenIn: GW_TOKEN, tokenOut: WETH, amountIn: 10n ** 18n, fee: POOL_FEE, sqrtPriceLimitX96: 0 });
+    const wethPerGw = Number(q[0]) / 1e18;
+    if (!(wethPerGw > 0)) throw new Error('dexscreener failed (' + String(e.message || e).slice(0, 120) + ') and pool quote empty');
+    gwUsd = ethUsd * wethPerGw;
+    gwSrc = 'onchain (dexscreener: ' + String(e.message || e).slice(0, 120) + ')';
+  }
+  if (!(gwUsd > 0)) throw new Error('bad gwUsd ' + gwUsd);
 
   let ethWei = BigInt(Math.ceil((TARGET_USD / ethUsd) * 1e6)) * 10n ** 12n;
   let gwUnits = BigInt(Math.ceil((TARGET_USD / gwUsd) / 1000) * 1000) * 10n ** 18n;
@@ -48,7 +80,7 @@ async function keepPrices(provider) {
   const [curEth, curGw] = await Promise.all([nft.mintPrice(), nft.gwMintPrice()]);
   const drifted = (cur, tgt) => cur === 0n || ((cur > tgt ? cur - tgt : tgt - cur) * 100n > cur * DRIFT_PCT);
 
-  const out = { market: { ethUsd, gwUsd }, target: { eth: Number(ethWei) / 1e18, gw: Number(gwUnits) / 1e18 }, onChain: { eth: Number(curEth) / 1e18, gw: Number(curGw) / 1e18 }, updated: false };
+  const out = { market: { ethUsd, gwUsd, gwSrc }, target: { eth: Number(ethWei) / 1e18, gw: Number(gwUnits) / 1e18 }, onChain: { eth: Number(curEth) / 1e18, gw: Number(curGw) / 1e18 }, updated: false };
   if (drifted(curEth, ethWei) || drifted(curGw, gwUnits)) {
     const wallet = new ethers.Wallet(process.env.OPERATOR_PRIVATE_KEY, provider);
     const tx = await (await nft.connect(wallet)).updatePrices(ethWei, gwUnits, { gasLimit: 150000 });
