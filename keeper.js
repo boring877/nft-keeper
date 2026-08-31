@@ -1,7 +1,8 @@
 // GachaWiki OGs keeper — one tick, run by GitHub Actions every 15 min.
 //   1. Prices: pin ETH + $GW mint prices to the same USD target (operator key).
-//   2. Buyback: withdraw accumulated ETH mint revenue, swap it for $GW on the
-//      GW/WETH Uniswap V3 pool, and burn every $GW bought (owner key).
+//   2. Buyback: withdraw accumulated ETH mint revenue, swap it (minus a small
+//      gas buffer) for $GW on the GW/WETH Uniswap V3 pool, and burn every $GW
+//      bought (owner key).
 // Runs from GitHub runner IPs (the Robinhood RPC throttles Cloudflare Worker
 // egress). All keys come from GitHub Secrets; nothing sensitive lives here.
 const { ethers } = require('ethers');
@@ -18,7 +19,8 @@ const TARGET_USD = 2;
 const DRIFT_PCT = 2n;
 const FLOOR_ETH_WEI = 400000000000000n; // mirrors the contract's price floors
 const FLOOR_GW_UNITS = 100000n * 10n ** 18n;
-const BUYBACK_MIN_WEI = 1000000000000000n; // act once ≥0.001 ETH accumulates
+const BUYBACK_MIN_WEI = 1000000000000000n; // act once the swap can carry ≥0.001 ETH
+const GAS_BUFFER_WEI = 500000000000000n; // ETH kept in the owner wallet for the swap/burn gas
 
 const NFT_ABI = [
   'function mintPrice() view returns (uint256)',
@@ -94,7 +96,6 @@ async function keepPrices(provider) {
 async function buybackBurn(provider) {
   const revenue = await provider.getBalance(NFT);
   const out = { revenueEth: ethers.formatEther(revenue) };
-  if (revenue < BUYBACK_MIN_WEI) { out.skipped = 'below 0.001 ETH threshold'; return out; }
 
   const owner = new ethers.Wallet(process.env.OWNER_PRIVATE_KEY, provider);
   const nft = new ethers.Contract(NFT, NFT_ABI, owner);
@@ -102,19 +103,31 @@ async function buybackBurn(provider) {
   const quoter = new ethers.Contract(QUOTER, QUOTER_ABI, provider);
   const router = new ethers.Contract(ROUTER, ROUTER_ABI, owner);
 
-  const q = await quoter.quoteExactInputSingle.staticCall({ tokenIn: WETH, tokenOut: GW_TOKEN, amountIn: revenue, fee: POOL_FEE, sqrtPriceLimitX96: 0 });
+  if (revenue >= BUYBACK_MIN_WEI) {
+    const t1 = await nft.withdraw(owner.address, { gasLimit: 100000 });
+    await t1.wait();
+    out.withdrawTx = t1.hash;
+  }
+
+  // Swap whatever the wallet holds beyond a gas cushion — sending the whole
+  // withdrawn amount as the swap value leaves nothing for the swap's own gas
+  // (the 2026-08-31 run withdrew the revenue, then failed on exactly that and
+  // left the ETH stranded in the owner wallet until the next tick sweeps it).
+  const spendable = (await provider.getBalance(owner.address)) - GAS_BUFFER_WEI;
+  if (spendable < BUYBACK_MIN_WEI) { out.skipped = 'below 0.001 ETH threshold'; return out; }
+  out.swapEth = ethers.formatEther(spendable);
+
+  const q = await quoter.quoteExactInputSingle.staticCall({ tokenIn: WETH, tokenOut: GW_TOKEN, amountIn: spendable, fee: POOL_FEE, sqrtPriceLimitX96: 0 });
   const minOut = (q[0] * 97n) / 100n;
   out.minGwOut = ethers.formatEther(minOut);
 
   const gwBefore = await gw.balanceOf(owner.address);
-  const t1 = await nft.withdraw(owner.address, { gasLimit: 100000 });
-  await t1.wait();
   const t2 = await router.multicall([
     (await router.exactInputSingle.populateTransaction({
       tokenIn: WETH, tokenOut: GW_TOKEN, fee: POOL_FEE, recipient: owner.address,
-      amountIn: revenue, amountOutMinimum: minOut, sqrtPriceLimitX96: 0,
+      amountIn: spendable, amountOutMinimum: minOut, sqrtPriceLimitX96: 0,
     })).data,
-  ], { value: revenue, gasLimit: 400000 });
+  ], { value: spendable, gasLimit: 400000 });
   await t2.wait();
   const bought = (await gw.balanceOf(owner.address)) - gwBefore;
   const t3 = await gw.transfer(DEAD, bought, { gasLimit: 100000 });
@@ -122,7 +135,7 @@ async function buybackBurn(provider) {
 
   out.done = true;
   out.gwBoughtAndBurned = ethers.formatEther(bought);
-  out.txs = [t1.hash, t2.hash, t3.hash];
+  out.txs = [out.withdrawTx, t2.hash, t3.hash].filter(Boolean);
   return out;
 }
 
